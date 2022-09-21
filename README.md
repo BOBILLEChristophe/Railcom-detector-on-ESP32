@@ -14,4 +14,3 @@ Mais toute autre centrale qui génère du DCC avec CUTOUT est compatible.
 Cette station est présentée sur le forum LOCODUINO : https://forum.locoduino.org/index.php?topic=1352.0
 
 Les fichiers Gerber du détecteur Railcom ainsi que la liste des composants seront bientôt disponibles.
-![image](https://user-images.githubusercontent.com/38000184/191467551-467daee9-5cc7-4121-8f35-9caeb6301c8e.png)
