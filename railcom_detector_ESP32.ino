@@ -275,7 +275,7 @@ void displayAddAddress(void *p)
 
 void setup()
 {
-  Serial.begin(500000);
+  Serial.begin(115200);
 
   Serial.printf("\n\nProject :    %s", PROJECT);
   Serial.printf("\nVersion :      %s", VERSION);
