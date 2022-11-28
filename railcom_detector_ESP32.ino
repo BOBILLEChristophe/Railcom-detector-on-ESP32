@@ -1,196 +1,281 @@
 /*
-   Marcel JEANSON - Christophe BOBILLE 09/2022 © locoduino.org
-   Adaptation de : https://github.com/RWVro/DCC_RailCom_Detector/blob/main/Detector.h
-*/
+   Programme de lecture, de décodage et d'affichage des messages Railcom ©
+   qui retourne l'adresse d'un décodeur (adresse courte ou longue) sur un afficheur LED 7 segments
 
+   Fonctionne exclusivement sur ESP32
+   © christophe bobille - www.locoduino.org 11/2022
+
+   lib_deps = locoduino/RingBuffer@^1.0.3 / https://github.com/Locoduino/RingBuffer
+   
+
+*/
 
 #ifndef ARDUINO_ARCH_ESP32
 #error "Select an ESP32 board"
 #endif
 
-#define VERSION "v 0.2"
-#define PROJECT "Railcom Detector ESP32"
+#include <Arduino.h>
 
-const byte railComRX  = 14;           // GPIO14 connecté à  RailCom Detector RX
-const byte railComInt = 13;           // GPIO13 connecté au BRAKE du LMD18200
+#define VERSION "v 2.8"
+#define PROJECT "Railcom Detector ESP32 (freeRTOS)"
 
-uint16_t receiveCnt = 0;
-uint16_t displCnt = 0;
-bool arrayComplete = false;
-
-uint8_t inByte = 0;
-
-const uint8_t rxArrayMax = 11;
-uint8_t rxArray[rxArrayMax];
-uint8_t rxArrayCnt = 0;
-
-bool ok_4_8Code = true;
-bool no_4_8Code = false;
-
-bool test_4_8Code = true;
-bool test_4_8Decimal = true;
-
-int convByte;
-
-int16_t cv = 0;
+#include <RingBuf.h>
+#define NB_ADDRESS_TO_COMPARE 100                // Nombre de valeurs à comparer pour obtenir l'adresse de la loco
+RingBuf<uint16_t, NB_ADDRESS_TO_COMPARE> buffer; // Instance
 
 // Identifiants des données du canal 1
-#define CH1_ADR_LOW  4
-#define CH1_ADR_HIGH 8
-byte dccAddr[2];         // Adresse du décodeur
+#define CH1_ADR_LOW  ( 1 << 2 )
+#define CH1_ADR_HIGH ( 1 << 3 )
 
-//==================================== Conversion Arrays =============================
+const byte railComRX = 14; // GPIO14 connecté à RailCom Detector RX
+const byte railComTX = 17; // GPIO17 non utilisée mais doit être déclarée
 
-int decodeArray[68] = {172, 170, 169, 165, 163, 166, 156, 154, 153, 149, 147, 150, 142, 141, 139, 177, 178, 180, 184, 116,
-                       114, 108, 106, 105, 101, 99, 102, 92, 90, 89, 85, 83, 86, 78, 77, 75, 71, 113, 232, 228, 226, 209, 201,
-                       197, 216, 212, 210, 202, 198, 204, 120, 23, 27, 29, 30, 46, 54, 58, 39, 43, 45, 53, 57, 51, 15, 240, 225, 31
-                      };       // 31 is end of table (0001 1111)
+const byte cutOutPin = GPIO_NUM_4;
+
+// Queue
+#define QUEUE_SIZE_0 10
+QueueHandle_t xQueue_0;
+
+#define QUEUE_SIZE_1 20
+QueueHandle_t xQueue_1;
+
+#define QUEUE_SIZE_2 2
+QueueHandle_t xQueue_2;
 
 
-int convertArray[67] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-                        27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
-                        52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66
-                       };
-
-//====================================== Convert 4_8 Table to dec. ====================
-
-void check_4_8Code()
+void receiveData(void *p)
 {
-  test_4_8Code = true;
-
-  int compareValue = inByte;
-  int i = 0;
-  while (compareValue != decodeArray[i])
+  TickType_t xLastWakeTime;
+  xLastWakeTime = xTaskGetTickCount();
+  uint8_t inByte {0};
+  uint8_t compt {0};
+  for (;;)
   {
-    if (decodeArray[i] == 31)             // End of table reached
+    while (Serial1.available() > 0)  // Sans détection du cutout
+    //while ((Serial1.available() > 0) && (! digitalRead(cutOutPin)))
     {
-      test_4_8Code = false;
-      goto out;
+      if (compt == 0)
+        inByte = '\0';
+      else
+        inByte = (uint8_t)Serial1.read();
+      if (compt < 3)
+        xQueueSend(xQueue_0, &inByte, 0);
+      compt++;
     }
-    i++;
+    compt = 0;
+    //Serial.println("---------");
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1)); // toutes les x ms
   }
-out:;
 }
 
-void convert4_8ToDec()
+void parseData(void *p)
 {
-  test_4_8Decimal = true;
+  bool start{false};
+  byte inByte{0};
+  uint8_t rxArray[8] {0};
+  uint8_t rxArrayCnt{0};
+  byte dccAddr[2] {0};
+  int16_t address{0};
+  TickType_t xLastWakeTime;
+  xLastWakeTime = xTaskGetTickCount();
 
-  int compareValue = inByte;
-  int i = 0;
-  while (compareValue != decodeArray[i])
+  byte decodeArray[] = {172, 170, 169, 165, 163, 166, 156, 154, 153, 149, 147, 150, 142, 141, 139, 177, 178, 180, 184, 116,
+                        114, 108, 106, 105, 101, 99, 102, 92, 90, 89, 85, 83, 86, 78, 77, 75, 71, 113, 232, 228, 226, 209, 201,
+                        197, 216, 212, 210, 202, 198, 204, 120, 23, 27, 29, 30, 46, 54, 58, 39, 43, 45, 53, 57, 51, 15, 240, 225, 31
+                       }; // 31 is end of table (0001 1111)
+
+  auto check_4_8_code = [&]() -> bool
   {
-    if (decodeArray[i] == 31)             // End of table reached
+    uint8_t index = 0;
+    while (inByte != decodeArray[index])
     {
-      test_4_8Decimal = false;
-      goto out;
+      if (decodeArray[index] == 31)
+        return false;
+      index++;
     }
-    i++;
-  }
-  inByte = convertArray[i];
-out:;
-}
+    inByte = index;
+    return true;
+  };
 
-//====================================== Print Array ============================
-
-void printRxArray()
-{
-  if (rxArray[0]&CH1_ADR_HIGH) dccAddr[0] = rxArray[1] | (rxArray[0] << 6);
-  if (rxArray[0]&CH1_ADR_LOW) dccAddr[1] = rxArray[1] | (rxArray[0] << 6);
-
-  cv = (dccAddr[1] - 128) << 8;
-  cv += dccAddr[0];
-
-  if (cv < 0) {
-    Serial.print("Adresse courte : ");
-    Serial.println( dccAddr[0] );
-  }
-  else        {
-    Serial.print("Adresse longue : ");
-    Serial.println( cv );
-  }
-}
-
-//====================================== Integer to Binair ============================
-
-void setIntToBinString()
-{
-  for (int k = 7; k >= 0; k--)
-    Serial.print(bitRead(convByte, k));
-  Serial.print(" ");
-}
-
-void printRxArrayToBin()
-{
-  int i = 0;
-  while (i <= rxArrayCnt)
+  auto printAdress = [&]()
   {
-    convByte = (rxArray[i]);
-    setIntToBinString();
-    i ++;
-  }
-  Serial.println("");
-}
+    //Serial.printf("Adresse loco : %d\n", address);
+    xQueueSend(xQueue_1, &address, portMAX_DELAY);
+  };
 
-void clearRxArray()
-{
-  int i = 0;
-  while (i < rxArrayMax - 1)
+  for (;;)
   {
-    rxArray[i] = 0;
-    i ++;
-  }
-}
-
-//===================================== ISR ==============================
-
-void IRAM_ATTR isr0()
-{
-  rxArrayCnt = 0;
-  while (Serial1.available())
-  {
-    for (int i  = 0; i < 8; i++)                  // Read 8 bytes
+    do
     {
-      inByte = Serial1.read();                     // Read byte
+      xQueueReceive(xQueue_0, &inByte, pdMS_TO_TICKS(portMAX_DELAY));
 
-      if (inByte == 0 || inByte == 255 || inByte < 0)
-        goto next;
+      if (inByte == '\0')
+        start = true;
+    } while (!start);
+    start = false;
 
-      check_4_8Code();
-
-      //      if (test_4_8Code)                             // Check if 4-8 code is ok, if ok , print
-      //      {
-      //        Serial.print(inByte);                     // Print 4-8 code
-      //        Serial.print(" ");
-      //      }
-      //      Serial.println("");
-
-      convert4_8ToDec();
-
-      if (test_4_8Decimal)                          // If ok_4_8Code is valid byte into  array
+    for (byte i = 0; i < 2; i++)
+    {
+      if (xQueueReceive(xQueue_0, &inByte, pdMS_TO_TICKS(portMAX_DELAY)) == pdPASS)
       {
-        rxArray[rxArrayCnt] = inByte;               // Byte into  array
-        if (rxArrayCnt < rxArrayMax)
-          rxArrayCnt++;                              // Increment char counter
-        //        else
-        //          rxArrayCnt = 0;
+        if (inByte >= 0x0F && inByte <= 0xF0)
+        {
+          if (check_4_8_code())
+          {
+            rxArray[rxArrayCnt] = inByte;
+            rxArrayCnt++;
+          }
+        }
       }
-next :;
+    }
+
+    if (rxArrayCnt == 2)
+    {
+      if (rxArray[0] & CH1_ADR_HIGH)
+        dccAddr[0] = rxArray[1] | (rxArray[0] << 6);
+      if (rxArray[0] & CH1_ADR_LOW)
+        dccAddr[1] = rxArray[1] | (rxArray[0] << 6);
+      address = (dccAddr[1] - 128) << 8;
+      if (address < 0)
+        address = dccAddr[0];
+      else
+        address += dccAddr[0];
+
+      bool testOk = true;
+      uint16_t j = 0;
+      buffer.pop(j);
+      buffer.push(address);
+      do
+      {
+        if (buffer[j] != address) {
+          testOk = false;
+          vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(100));
+        }
+        j++;
+      } while (testOk && j <= buffer.size());
+
+      if (testOk)
+        printAdress();
+      // else
+      //   Serial.println("NOK");
+    }
+
+    rxArrayCnt = 0;
+    for (byte i = 0; i < 2; i++)
+      rxArray[i] = 0;
+
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10)); // toutes les x ms
+  }
+}
+
+void printAddress(void *p)
+{
+  TickType_t xLastWakeTime;
+  xLastWakeTime = xTaskGetTickCount();
+  uint16_t address{0};
+
+  for (;;)
+  {
+    address = 0;
+    xQueueReceive(xQueue_1, &address, pdMS_TO_TICKS(0));
+    xQueueSend(xQueue_2, &address, portMAX_DELAY);
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(100)); // toutes les x ms
+  }
+}
+
+
+void displayAddAddress(void *p)
+{
+  TickType_t xLastWakeTime;
+  xLastWakeTime = xTaskGetTickCount();
+  uint16_t address{0};
+  const byte pinOutCathode[] = {22, 21, 32, 25, 26, 23, 33};
+  const byte pinOutAnode[] = {19, 18, 12, 13};
+  const byte chiffre[] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x7, 0x7F, 0x6F};
+  uint8_t unit, dizaine, centaine, millier;
+
+  for (auto el : pinOutCathode)
+  {
+    pinMode(el, OUTPUT);
+    digitalWrite(el, HIGH);
+  }
+
+  for (auto el : pinOutAnode)
+  {
+    pinMode(el, OUTPUT);
+    digitalWrite(el, LOW);
+  }
+
+  auto separateur = [&](uint16_t address)
+  {
+    if (address > 999)
+    {
+      millier = address / 1000; // on recupere les milliers
+      address -= millier * 1000;
+    }
+    else
+      millier = 0;
+
+    if (address > 99)
+    {
+      centaine = address / 100; // on recupere les centaines
+      address -= centaine * 100;
+    }
+    else
+      centaine = 0;
+
+    if (address > 9)
+    {
+      dizaine = address / 10; // on recupere les centaines
+      address -= dizaine * 10;
+    }
+    else
+      dizaine = 0;
+
+    unit = address; // on recupere les unites
+  };
+
+  for (;;)
+  {
+    xQueueReceive(xQueue_2, &address, pdMS_TO_TICKS(0));
+    separateur(address);
+
+    for (byte j = 0; j < 4; j++)
+    {
+      digitalWrite(pinOutAnode[j], HIGH); // Unités
+      bool etat;
+      for (byte i = 0; i < 7; i++)
+      {
+        switch (j)
+        {
+          case 0:
+            etat = (chiffre[unit] & (1 << i)) >> i;
+            break;
+          case 1:
+            if (millier > 0  || centaine > 0 || dizaine > 0)
+              etat = (chiffre[dizaine] & (1 << i)) >> i;
+            break;
+          case 2:
+            if (millier > 0 || centaine > 0)
+              etat = (chiffre[centaine] & (1 << i)) >> i;
+            break;
+          case 3:
+            if (millier > 0 )
+              etat = (chiffre[millier] & (1 << i)) >> i;
+            break;
+        }
+        digitalWrite(pinOutCathode[i], !etat);
+        etat = 0;
+      }
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1)); // toutes les x ms
+      digitalWrite(pinOutAnode[j], LOW);
     }
   }
-  if (rxArrayCnt <= 1)                              // Save only arrays with 2 or more bytes
-  {
-    clearRxArray();
-    return;
-  }
-  printRxArray();
-  //printRxArrayToBin();
-  clearRxArray();
 }
 
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(500000);
 
   Serial.printf("\n\nProject :    %s", PROJECT);
   Serial.printf("\nVersion :      %s", VERSION);
@@ -198,12 +283,20 @@ void setup()
   Serial.printf("\nCompiled :     %s", __DATE__);
   Serial.printf(" - %s\n\n", __TIME__);
 
-  pinMode(railComInt, INPUT);
-  pinMode(railComRX, INPUT);
-  Serial1.begin(250000, SERIAL_8N1, railComRX, 12);    // Define and start ESP32 serial port
-  delay(1000);
-  attachInterrupt(digitalPinToInterrupt(railComInt), isr0, RISING);
+  Serial1.begin(250000, SERIAL_8N1, railComRX, railComTX); // Port série pour la réception des données (250k bauds)
+  uint16_t x = 0;
+  for (uint8_t i = 0; i < NB_ADDRESS_TO_COMPARE; i++) // On place des zéros dans le buffer de comparaison
+    buffer.push(x);
+  pinMode(cutOutPin, INPUT_PULLUP);
+  xQueue_0 = xQueueCreate(QUEUE_SIZE_0, sizeof(uint8_t));
+  xQueue_1 = xQueueCreate(QUEUE_SIZE_1, sizeof(uint16_t));
+  xQueue_2 = xQueueCreate(QUEUE_SIZE_2, sizeof(uint16_t));                                   // Création de la file pour les échanges de data entre les 2 tâches
+  xTaskCreatePinnedToCore(receiveData,       "ReceiveData",    2 * 1024, NULL, 4, NULL, 1);  // Création de la tâches pour la réception
+  xTaskCreatePinnedToCore(parseData,         "ParseData",      2 * 1024, NULL, 5, NULL, 0);  // Création de la tâches pour le traitement
+  xTaskCreatePinnedToCore(printAddress,      "PrintAddress",   2 * 1024, NULL, 4, NULL, 0);  // Création de la tâches pour l'affichage (1/2)
+  xTaskCreatePinnedToCore(displayAddAddress, "DisplayAddress", 2 * 1024, NULL, 5, NULL, 0);  // Création de la tâches pour l'affichage (2/2)
 }
 
 void loop()
-{}
+{
+}
