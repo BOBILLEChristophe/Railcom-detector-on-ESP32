@@ -1,12 +1,15 @@
 /*
-   Programme de lecture, de décodage et d'affichage des messages Railcom ©
+   Programme de lecture, de décodage et d'affichage des messages Railcom©
    qui retourne l'adresse d'un décodeur (adresse courte ou longue) sur un afficheur LED 7 segments
 
    Fonctionne exclusivement sur ESP32
    © christophe bobille - www.locoduino.org 11/2022
 
+   Pour plus d'infos : https://forum.locoduino.org/index.php?topic=1352.msg15944#msg15944
+
    lib_deps = locoduino/RingBuffer@^1.0.3 / https://github.com/Locoduino/RingBuffer
-   
+
+   inspired by : https://github.com/RWVro/DCC_RailCom_Detector/blob/main/Detector.h
 
 */
 
@@ -16,21 +19,25 @@
 
 #include <Arduino.h>
 
-#define VERSION "v 2.8"
+#define VERSION "v 3.1"
 #define PROJECT "Railcom Detector ESP32 (freeRTOS)"
+
+// #define CUTOUT
 
 #include <RingBuf.h>
 #define NB_ADDRESS_TO_COMPARE 100                // Nombre de valeurs à comparer pour obtenir l'adresse de la loco
 RingBuf<uint16_t, NB_ADDRESS_TO_COMPARE> buffer; // Instance
 
 // Identifiants des données du canal 1
-#define CH1_ADR_LOW  ( 1 << 2 )
-#define CH1_ADR_HIGH ( 1 << 3 )
+#define CH1_ADR_LOW (1 << 2)
+#define CH1_ADR_HIGH (1 << 3)
 
 const byte railComRX = 14; // GPIO14 connecté à RailCom Detector RX
 const byte railComTX = 17; // GPIO17 non utilisée mais doit être déclarée
 
+#ifdef CUTOUT
 const byte cutOutPin = GPIO_NUM_4;
+#endif
 
 // Queue
 #define QUEUE_SIZE_0 10
@@ -42,17 +49,19 @@ QueueHandle_t xQueue_1;
 #define QUEUE_SIZE_2 2
 QueueHandle_t xQueue_2;
 
-
 void receiveData(void *p)
 {
   TickType_t xLastWakeTime;
   xLastWakeTime = xTaskGetTickCount();
-  uint8_t inByte {0};
-  uint8_t compt {0};
+  uint8_t inByte{0};
+  uint8_t compt{0};
   for (;;)
   {
-    while (Serial1.available() > 0)  // Sans détection du cutout
-    //while ((Serial1.available() > 0) && (! digitalRead(cutOutPin)))
+#ifdef CUTOUT
+    while ((Serial1.available() > 0) && (!digitalRead(cutOutPin)))
+#else
+    while (Serial1.available() > 0) // Sans détection du cutout
+#endif
     {
       if (compt == 0)
         inByte = '\0';
@@ -63,7 +72,6 @@ void receiveData(void *p)
       compt++;
     }
     compt = 0;
-    //Serial.println("---------");
     vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1)); // toutes les x ms
   }
 }
@@ -72,34 +80,37 @@ void parseData(void *p)
 {
   bool start{false};
   byte inByte{0};
-  uint8_t rxArray[8] {0};
+  uint8_t rxArray[8]{0};
   uint8_t rxArrayCnt{0};
-  byte dccAddr[2] {0};
+  byte dccAddr[2]{0};
   int16_t address{0};
   TickType_t xLastWakeTime;
   xLastWakeTime = xTaskGetTickCount();
 
-  byte decodeArray[] = {172, 170, 169, 165, 163, 166, 156, 154, 153, 149, 147, 150, 142, 141, 139, 177, 178, 180, 184, 116,
-                        114, 108, 106, 105, 101, 99, 102, 92, 90, 89, 85, 83, 86, 78, 77, 75, 71, 113, 232, 228, 226, 209, 201,
-                        197, 216, 212, 210, 202, 198, 204, 120, 23, 27, 29, 30, 46, 54, 58, 39, 43, 45, 53, 57, 51, 15, 240, 225, 31
-                       }; // 31 is end of table (0001 1111)
+  byte decodeArray[] = {255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 255, 255, 255, 255, 255, 255, 255, 51, 255, 255, 255, 52,
+                        255, 53, 54, 255, 255, 255, 255, 255, 255, 255, 255, 58, 255, 255, 255, 59, 255, 60, 55, 255, 255, 255, 255, 63, 255, 61, 56, 255, 255, 62,
+                        57, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 36, 255, 255, 255, 35, 255, 34, 33, 255, 255, 255, 255, 31, 255, 30, 32, 255,
+                        255, 29, 28, 255, 27, 255, 255, 255, 255, 255, 255, 25, 255, 24, 26, 255, 255, 23, 22, 255, 21, 255, 255, 255, 255, 37, 20, 255, 19, 255, 255,
+                        255, 50, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 14, 255, 13, 12, 255, 255, 255, 255, 10, 255,
+                        9, 11, 255, 255, 8, 7, 255, 6, 255, 255, 255, 255, 255, 255, 4, 255, 3, 5, 255, 255, 2, 1, 255, 0, 255, 255, 255, 255, 15, 16, 255, 17, 255, 255, 255,
+                        18, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 43, 48, 255, 255, 42, 47, 255, 49, 255, 255, 255, 255, 41, 46, 255, 45, 255, 255,
+                        255, 44, 255, 255, 255, 255, 255, 255, 255, 255, 66, 40, 255, 39, 255, 255, 255, 38, 255, 255, 255, 255, 255, 255, 255, 65, 255, 255, 255, 255,
+                        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
+
 
   auto check_4_8_code = [&]() -> bool
   {
-    uint8_t index = 0;
-    while (inByte != decodeArray[index])
+    if(decodeArray[inByte] < 255)
     {
-      if (decodeArray[index] == 31)
-        return false;
-      index++;
+      inByte = decodeArray[inByte];
+      return true;
     }
-    inByte = index;
-    return true;
+    return false;
   };
 
   auto printAdress = [&]()
   {
-    //Serial.printf("Adresse loco : %d\n", address);
+    // Serial.printf("Adresse loco : %d\n", address);
     xQueueSend(xQueue_1, &address, portMAX_DELAY);
   };
 
@@ -118,7 +129,7 @@ void parseData(void *p)
     {
       if (xQueueReceive(xQueue_0, &inByte, pdMS_TO_TICKS(portMAX_DELAY)) == pdPASS)
       {
-        if (inByte >= 0x0F && inByte <= 0xF0)
+        if (inByte > 0x0F && inByte < 0xF0)
         {
           if (check_4_8_code())
           {
@@ -147,7 +158,8 @@ void parseData(void *p)
       buffer.push(address);
       do
       {
-        if (buffer[j] != address) {
+        if (buffer[j] != address)
+        {
           testOk = false;
           vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(100));
         }
@@ -178,11 +190,11 @@ void printAddress(void *p)
   {
     address = 0;
     xQueueReceive(xQueue_1, &address, pdMS_TO_TICKS(0));
+    // Serial.println(address);
     xQueueSend(xQueue_2, &address, portMAX_DELAY);
     vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(100)); // toutes les x ms
   }
 }
-
 
 void displayAddAddress(void *p)
 {
@@ -248,21 +260,21 @@ void displayAddAddress(void *p)
       {
         switch (j)
         {
-          case 0:
-            etat = (chiffre[unit] & (1 << i)) >> i;
-            break;
-          case 1:
-            if (millier > 0  || centaine > 0 || dizaine > 0)
-              etat = (chiffre[dizaine] & (1 << i)) >> i;
-            break;
-          case 2:
-            if (millier > 0 || centaine > 0)
-              etat = (chiffre[centaine] & (1 << i)) >> i;
-            break;
-          case 3:
-            if (millier > 0 )
-              etat = (chiffre[millier] & (1 << i)) >> i;
-            break;
+        case 0:
+          etat = (chiffre[unit] & (1 << i)) >> i;
+          break;
+        case 1:
+          if (millier > 0 || centaine > 0 || dizaine > 0)
+            etat = (chiffre[dizaine] & (1 << i)) >> i;
+          break;
+        case 2:
+          if (millier > 0 || centaine > 0)
+            etat = (chiffre[centaine] & (1 << i)) >> i;
+          break;
+        case 3:
+          if (millier > 0)
+            etat = (chiffre[millier] & (1 << i)) >> i;
+          break;
         }
         digitalWrite(pinOutCathode[i], !etat);
         etat = 0;
@@ -287,14 +299,16 @@ void setup()
   uint16_t x = 0;
   for (uint8_t i = 0; i < NB_ADDRESS_TO_COMPARE; i++) // On place des zéros dans le buffer de comparaison
     buffer.push(x);
+#ifdef CUTOUT
   pinMode(cutOutPin, INPUT_PULLUP);
+#endif
   xQueue_0 = xQueueCreate(QUEUE_SIZE_0, sizeof(uint8_t));
   xQueue_1 = xQueueCreate(QUEUE_SIZE_1, sizeof(uint16_t));
-  xQueue_2 = xQueueCreate(QUEUE_SIZE_2, sizeof(uint16_t));                                   // Création de la file pour les échanges de data entre les 2 tâches
-  xTaskCreatePinnedToCore(receiveData,       "ReceiveData",    2 * 1024, NULL, 4, NULL, 1);  // Création de la tâches pour la réception
-  xTaskCreatePinnedToCore(parseData,         "ParseData",      2 * 1024, NULL, 5, NULL, 0);  // Création de la tâches pour le traitement
-  xTaskCreatePinnedToCore(printAddress,      "PrintAddress",   2 * 1024, NULL, 4, NULL, 0);  // Création de la tâches pour l'affichage (1/2)
-  xTaskCreatePinnedToCore(displayAddAddress, "DisplayAddress", 2 * 1024, NULL, 5, NULL, 0);  // Création de la tâches pour l'affichage (2/2)
+  xQueue_2 = xQueueCreate(QUEUE_SIZE_2, sizeof(uint16_t));                                  // Création de la file pour les échanges de data entre les 2 tâches
+  xTaskCreatePinnedToCore(receiveData, "ReceiveData", 2 * 1024, NULL, 4, NULL, 1);          // Création de la tâches pour la réception
+  xTaskCreatePinnedToCore(parseData, "ParseData", 2 * 1024, NULL, 5, NULL, 0);              // Création de la tâches pour le traitement
+  xTaskCreatePinnedToCore(printAddress, "PrintAddress", 2 * 1024, NULL, 4, NULL, 0);        // Création de la tâches pour l'affichage (1/2)
+  xTaskCreatePinnedToCore(displayAddAddress, "DisplayAddress", 2 * 1024, NULL, 5, NULL, 0); // Création de la tâches pour l'affichage (2/2)
 }
 
 void loop()
