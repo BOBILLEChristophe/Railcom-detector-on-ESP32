@@ -21,6 +21,7 @@
 
 #define VERSION "v 3.1"
 #define PROJECT "Railcom Detector ESP32 (freeRTOS)"
+#define AUTHOR  "christophe BOBILLE Locoduino : christophe.bobille@gmail.com"
 
 // #define CUTOUT
 
@@ -291,6 +292,7 @@ void setup()
 
   Serial.printf("\n\nProject :    %s", PROJECT);
   Serial.printf("\nVersion :      %s", VERSION);
+  Serial.printf("\nAuthor :       %s", AUTHOR);
   Serial.printf("\nFichier :      %s", __FILE__);
   Serial.printf("\nCompiled :     %s", __DATE__);
   Serial.printf(" - %s\n\n", __TIME__);
