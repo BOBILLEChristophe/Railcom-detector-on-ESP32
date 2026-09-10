@@ -1,16 +1,20 @@
 /*
-   Programme de lecture, de décodage et d'affichage des messages Railcom©
-   qui retourne l'adresse d'un décodeur (adresse courte ou longue) sur un afficheur LED 7 segments
+   RailCom Detector ESP32 - v4.5
 
-   Fonctionne exclusivement sur ESP32
-   © christophe bobille - www.locoduino.org 11/2022
+   Evolution de la version v3.1 :
+   - reception RailCom par le driver UART ESP-IDF
+   - UART1 materiel a 250000 bauds, 8N1, RX GPIO0
+   - horloge UART forcee sur APB
+   - reception evenementielle via la file d'evenements UART
+   - lecture evenementielle, parseur continu independant des frontieres UART_DATA
+   - suppression du polling Serial1.available() et des temporisations de reception
+   - conservation du decodage 4/8 RailCom canal 1
+   - validation d'adresse par 5 lectures consecutives identiques
+   - perte RailCom apres 1 seconde sans confirmation de l'adresse
+   - sortie : Serial uniquement
 
-   Pour plus d'infos : https://forum.locoduino.org/index.php?topic=1352.msg15944#msg15944
-
-   lib_deps = locoduino/RingBuffer@^1.0.3 / https://github.com/Locoduino/RingBuffer
-
-   inspired by : https://github.com/RWVro/DCC_RailCom_Detector/blob/main/Detector.h
-
+   © Christophe BOBILLE - Locoduino
+   https://github.com/BOBILLEChristophe/Railcom-detector-on-ESP32/edit/main/railcom_detector_ESP32.ino
 */
 
 #ifndef ARDUINO_ARCH_ESP32
@@ -18,301 +22,460 @@
 #endif
 
 #include <Arduino.h>
+#include "driver/uart.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 
-#define VERSION "v 3.1"
-#define PROJECT "Railcom Detector ESP32 (freeRTOS)"
-#define AUTHOR  "christophe BOBILLE Locoduino : christophe.bobille@gmail.com"
+#define VERSION "v 4.5-serial"
+#define PROJECT "Railcom Detector ESP32 - UART event driven"
+#define AUTHOR  "christophe BOBILLE - Locoduino"
 
-// #define CUTOUT
+// -----------------------------------------------------------------------------
+// Configuration RailCom / UART
+// -----------------------------------------------------------------------------
 
-#include <RingBuf.h>
-#define NB_ADDRESS_TO_COMPARE 100                // Nombre de valeurs à comparer pour obtenir l'adresse de la loco
-RingBuf<uint16_t, NB_ADDRESS_TO_COMPARE> buffer; // Instance
+constexpr uart_port_t RAILCOM_UART_NUM = UART_NUM_1;
+constexpr gpio_num_t RAILCOM_RX_PIN = GPIO_NUM_0;
+constexpr uint32_t RAILCOM_BAUD_RATE = 250000;
 
-// Identifiants des données du canal 1
-#define CH1_ADR_LOW (1 << 2)
-#define CH1_ADR_HIGH (1 << 3)
+// Le FIFO materiel de l'ESP32 classique fait 128 octets.
+// Le buffer driver doit etre strictement superieur au FIFO.
+constexpr int RAILCOM_RX_BUFFER_SIZE = 256;
+constexpr int RAILCOM_EVENT_QUEUE_SIZE = 20;
 
-const byte railComRX = 14; // GPIO14 connecté à RailCom Detector RX
-const byte railComTX = 17; // GPIO17 non utilisée mais doit être déclarée
+// Seuil volontairement eleve : une rafale RailCom normale (max. 8 octets
+// sur un cutout) sera normalement livree par timeout, pas par FIFO plein.
+constexpr uint8_t RAILCOM_RX_FIFO_THRESHOLD = 120;
 
-#ifdef CUTOUT
-const byte cutOutPin = GPIO_NUM_4;
-#endif
+// Timeout exprime en periodes de symbole UART.
+// A 250 kbit/s en 8N1 : 1 symbole ~= 40 us.
+// Le parseur V4.3 est independant des frontieres d'evenements UART,
+// donc un timeout court (~80 us) donne une bonne reactivite sans imposer
+// que les deux octets d'un datagramme arrivent dans le meme evenement.
+constexpr uint8_t RAILCOM_RX_TIMEOUT_SYMBOLS = 2;
 
-// Queue
-#define QUEUE_SIZE_0 10
-QueueHandle_t xQueue_0;
+// Nombre de reconstructions identiques consecutives avant validation.
+constexpr uint8_t ADDRESS_CONFIRMATIONS = 5;
 
-#define QUEUE_SIZE_1 20
-QueueHandle_t xQueue_1;
+// Une adresse validee est consideree perdue si aucun nouveau groupe de
+// confirmations valides n'est obtenu pendant ce delai.
+// 1000 ms evite les extinctions sur un trou ponctuel tout en restant reactif.
+constexpr uint32_t RAILCOM_LOSS_TIMEOUT_MS = 1000;
 
-#define QUEUE_SIZE_2 2
-QueueHandle_t xQueue_2;
+QueueHandle_t railcomUartQueue = nullptr;
 
-void receiveData(void *p)
+// -----------------------------------------------------------------------------
+// Etat RailCom
+// -----------------------------------------------------------------------------
+
+volatile uint16_t currentAddress = 0;
+
+uint8_t adr1Data = 0;      // Datagramme ID1 : ADR Address High
+uint8_t adr2Data = 0;      // Datagramme ID2 : ADR Address Low
+bool adr1Valid = false;
+bool adr2Valid = false;
+
+uint16_t candidateAddress = 0;
+uint8_t confirmationCount = 0;
+uint16_t lastValidatedAddress = 0;
+uint32_t lastValidatedReceptionMs = 0;
+
+bool waitingSecondSymbol = false;
+uint8_t firstDecodedSymbol = 0;
+
+// -----------------------------------------------------------------------------
+// Table de decodage RailCom 4/8
+// raw UART -> valeur 6 bits (0..63), 64..66 = mots de controle, 255 = invalide
+// Table reprise de la version v3.1.
+// -----------------------------------------------------------------------------
+
+constexpr uint8_t decodeArray[256] = {
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,  64,
+  255, 255, 255, 255, 255, 255, 255,  51, 255, 255, 255,  52, 255,  53,  54, 255,
+  255, 255, 255, 255, 255, 255, 255,  58, 255, 255, 255,  59, 255,  60,  55, 255,
+  255, 255, 255,  63, 255,  61,  56, 255, 255,  62,  57, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255,  36, 255, 255, 255,  35, 255,  34,  33, 255,
+  255, 255, 255,  31, 255,  30,  32, 255, 255,  29,  28, 255,  27, 255, 255, 255,
+  255, 255, 255,  25, 255,  24,  26, 255, 255,  23,  22, 255,  21, 255, 255, 255,
+  255,  37,  20, 255,  19, 255, 255, 255,  50, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,  14, 255,  13,  12, 255,
+  255, 255, 255,  10, 255,   9,  11, 255, 255,   8,   7, 255,   6, 255, 255, 255,
+  255, 255, 255,   4, 255,   3,   5, 255, 255,   2,   1, 255,   0, 255, 255, 255,
+  255,  15,  16, 255,  17, 255, 255, 255,  18, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255,  43,  48, 255, 255,  42,  47, 255,  49, 255, 255, 255,
+  255,  41,  46, 255,  45, 255, 255, 255,  44, 255, 255, 255, 255, 255, 255, 255,
+  255,  66,  40, 255,  39, 255, 255, 255,  38, 255, 255, 255, 255, 255, 255, 255,
+   65, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255
+};
+
+
+// Contrôles de cohérence de la table 4/8.
+// Ces quatre codes sont ceux réellement observés avec la locomotive d'adresse 12.
+static_assert(decodeArray[0x99] == 8,  "RailCom 4/8 : 0x99 doit decoder en 8");
+static_assert(decodeArray[0x8E] == 12, "RailCom 4/8 : 0x8E doit decoder en 12");
+static_assert(decodeArray[0xA3] == 4,  "RailCom 4/8 : 0xA3 doit decoder en 4");
+static_assert(decodeArray[0xAC] == 0,  "RailCom 4/8 : 0xAC doit decoder en 0");
+
+// -----------------------------------------------------------------------------
+// Initialisation UART RailCom
+// -----------------------------------------------------------------------------
+
+void initRailComUart()
 {
-  TickType_t xLastWakeTime;
-  xLastWakeTime = xTaskGetTickCount();
-  uint8_t inByte{0};
-  uint8_t compt{0};
-  for (;;)
-  {
-#ifdef CUTOUT
-    while ((Serial1.available() > 0) && (!digitalRead(cutOutPin)))
-#else
-    while (Serial1.available() > 0) // Sans détection du cutout
-#endif
-    {
-      if (compt == 0)
-        inByte = '\0';
-      else
-        inByte = (uint8_t)Serial1.read();
-      if (compt < 3)
-        xQueueSend(xQueue_0, &inByte, 0);
-      compt++;
-    }
-    compt = 0;
-    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1)); // toutes les x ms
-  }
+  uart_config_t uartConfig = {};
+  uartConfig.baud_rate = RAILCOM_BAUD_RATE;
+  uartConfig.data_bits = UART_DATA_8_BITS;
+  uartConfig.parity = UART_PARITY_DISABLE;
+  uartConfig.stop_bits = UART_STOP_BITS_1;
+  uartConfig.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+  uartConfig.source_clk = UART_SCLK_APB;
+
+  ESP_ERROR_CHECK(uart_param_config(RAILCOM_UART_NUM, &uartConfig));
+
+  // RX uniquement : aucun GPIO TX n'est necessaire.
+  ESP_ERROR_CHECK(uart_set_pin(
+    RAILCOM_UART_NUM,
+    UART_PIN_NO_CHANGE,
+    RAILCOM_RX_PIN,
+    UART_PIN_NO_CHANGE,
+    UART_PIN_NO_CHANGE
+  ));
+
+  ESP_ERROR_CHECK(uart_driver_install(
+    RAILCOM_UART_NUM,
+    RAILCOM_RX_BUFFER_SIZE,
+    0,                         // pas de buffer TX
+    RAILCOM_EVENT_QUEUE_SIZE,
+    &railcomUartQueue,
+    0
+  ));
+
+  ESP_ERROR_CHECK(uart_set_rx_full_threshold(
+    RAILCOM_UART_NUM,
+    RAILCOM_RX_FIFO_THRESHOLD
+  ));
+
+  ESP_ERROR_CHECK(uart_set_rx_timeout(
+    RAILCOM_UART_NUM,
+    RAILCOM_RX_TIMEOUT_SYMBOLS
+  ));
+
+  uart_flush_input(RAILCOM_UART_NUM);
 }
 
-void parseData(void *p)
+// -----------------------------------------------------------------------------
+// Decodage RailCom
+// -----------------------------------------------------------------------------
+
+bool decode4of8(uint8_t raw, uint8_t &decoded)
 {
-  bool start{false};
-  byte inByte{0};
-  uint8_t rxArray[8]{0};
-  uint8_t rxArrayCnt{0};
-  byte dccAddr[2]{0};
-  int16_t address{0};
-  TickType_t xLastWakeTime;
-  xLastWakeTime = xTaskGetTickCount();
+  const uint8_t value = decodeArray[raw];
 
-  const byte decodeArray[] = {255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 255, 255, 255, 255, 255, 255, 255, 51, 255, 255, 255, 52,
-                        255, 53, 54, 255, 255, 255, 255, 255, 255, 255, 255, 58, 255, 255, 255, 59, 255, 60, 55, 255, 255, 255, 255, 63, 255, 61, 56, 255, 255, 62,
-                        57, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 36, 255, 255, 255, 35, 255, 34, 33, 255, 255, 255, 255, 31, 255, 30, 32, 255,
-                        255, 29, 28, 255, 27, 255, 255, 255, 255, 255, 255, 25, 255, 24, 26, 255, 255, 23, 22, 255, 21, 255, 255, 255, 255, 37, 20, 255, 19, 255, 255,
-                        255, 50, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 14, 255, 13, 12, 255, 255, 255, 255, 10, 255,
-                        9, 11, 255, 255, 8, 7, 255, 6, 255, 255, 255, 255, 255, 255, 4, 255, 3, 5, 255, 255, 2, 1, 255, 0, 255, 255, 255, 255, 15, 16, 255, 17, 255, 255, 255,
-                        18, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 43, 48, 255, 255, 42, 47, 255, 49, 255, 255, 255, 255, 41, 46, 255, 45, 255, 255,
-                        255, 44, 255, 255, 255, 255, 255, 255, 255, 255, 66, 40, 255, 39, 255, 255, 255, 38, 255, 255, 255, 255, 255, 255, 255, 65, 255, 255, 255, 255,
-                        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
-
-
-  auto check_4_8_code = [&]() -> bool
+  // Pour une adresse, on attend un symbole de donnees 6 bits.
+  // 64, 65 et 66 sont des mots de controle RailCom.
+  if (value > 63)
   {
-    if(decodeArray[inByte] < 255)
-    {
-      inByte = decodeArray[inByte];
-      return true;
-    }
     return false;
-  };
+  }
 
-  auto printAdress = [&]()
+  decoded = value;
+  return true;
+}
+
+uint16_t buildAddress()
+{
+  // Meme principe que la V3.1, mais ecrit explicitement :
+  // - ADR1 < 128 => adresse courte / consist : adresse dans ADR2
+  // - ADR1 >= 128 => adresse etendue : 6 bits hauts dans ADR1,
+  //   apres retrait du marqueur 0b10xxxxxx, puis 8 bits bas dans ADR2.
+  if (adr1Data < 128)
   {
-    // Serial.printf("Adresse loco : %d\n", address);
-    xQueueSend(xQueue_1, &address, portMAX_DELAY);
-  };
+    return adr2Data;
+  }
+
+  return static_cast<uint16_t>(
+    (static_cast<uint16_t>(adr1Data - 128) << 8) | adr2Data
+  );
+}
+
+void validateAddress(uint16_t address)
+{
+  if (address == 0)
+  {
+    candidateAddress = 0;
+    confirmationCount = 0;
+    return;
+  }
+
+  // Toute adresse differente casse la serie de confirmations.
+  if (address != candidateAddress)
+  {
+    candidateAddress = address;
+    confirmationCount = 1;
+    return;
+  }
+
+  if (confirmationCount < ADDRESS_CONFIRMATIONS)
+  {
+    confirmationCount++;
+  }
+
+  // Il faut 5 reconstructions identiques consecutives pour :
+  // - valider une nouvelle adresse ;
+  // - ou confirmer qu'une adresse deja affichee est toujours presente.
+  if (confirmationCount < ADDRESS_CONFIRMATIONS)
+  {
+    return;
+  }
+
+  const uint32_t now = millis();
+
+  if (address != lastValidatedAddress)
+  {
+    lastValidatedAddress = address;
+    currentAddress = address;
+
+    Serial.printf("Adresse loco validee : %u\n", address);
+  }
+
+  // Le watchdog de presence n'est rafraichi qu'apres un nouveau groupe
+  // complet de 5 confirmations consecutives.
+  lastValidatedReceptionMs = now;
+
+  // On repart de zero pour exiger un nouveau groupe de 5 confirmations
+  // avant le prochain rafraichissement du watchdog.
+  confirmationCount = 0;
+}
+
+void checkRailComLoss()
+{
+  if (lastValidatedAddress == 0)
+  {
+    return;
+  }
+
+  const uint32_t now = millis();
+
+  if (static_cast<uint32_t>(now - lastValidatedReceptionMs) <
+      RAILCOM_LOSS_TIMEOUT_MS)
+  {
+    return;
+  }
+
+  // Plus aucune serie valide de confirmations depuis 1 seconde :
+  // la locomotive est consideree absente.
+  const uint16_t lostAddress = lastValidatedAddress;
+
+  currentAddress = 0;
+  lastValidatedAddress = 0;
+  lastValidatedReceptionMs = 0;
+
+  Serial.printf("Plus de locomotive detectee (derniere adresse : %u)\n",
+                lostAddress);
+
+  candidateAddress = 0;
+  confirmationCount = 0;
+
+  adr1Valid = false;
+  adr2Valid = false;
+  waitingSecondSymbol = false;
+}
+
+// -----------------------------------------------------------------------------
+// Parseur continu du flux UART RailCom
+// -----------------------------------------------------------------------------
+//
+// Important : un evenement UART_DATA n'est PAS une frontiere de trame RailCom.
+// Le driver peut livrer :
+//   [99 8E] [A3 AC]
+// ou :
+//   [F0 A3 AC 99] [8E ...]
+// ou encore couper une paire entre deux evenements.
+//
+// On traite donc les octets comme un flux continu.
+//
+// Un datagramme RailCom utile pour l'adresse contient deux symboles 4/8 :
+//   symbole 0 : IIII DD
+//   symbole 1 : DDDDDD
+//
+// Pour le canal 1 :
+//   ID = 1 -> ADR1 (partie haute)
+//   ID = 2 -> ADR2 (partie basse)
+
+void processAddressDatagram(uint8_t symbol0, uint8_t symbol1)
+{
+  const uint8_t identifier = symbol0 >> 2;
+  const uint8_t data = static_cast<uint8_t>(
+    ((symbol0 & 0x03) << 6) | symbol1
+  );
+
+  switch (identifier)
+  {
+    case 1: // ADR1 : Address High
+      adr1Data = data;
+      adr1Valid = true;
+      break;
+
+    case 2: // ADR2 : Address Low
+      adr2Data = data;
+      adr2Valid = true;
+      break;
+
+    default:
+      return;
+  }
+
+  if (adr1Valid && adr2Valid)
+  {
+    const uint16_t address = buildAddress();
+
+    // Les deux morceaux sont consommes ensemble.
+    adr1Valid = false;
+    adr2Valid = false;
+
+    validateAddress(address);
+  }
+}
+
+void feedRailComByte(uint8_t raw)
+{
+  const uint8_t decoded = decodeArray[raw];
+
+  // Mot invalide ou mot de controle RailCom (64..66).
+  // Il sert de separateur naturel et annule une paire incomplete.
+  if (decoded > 63)
+  {
+    waitingSecondSymbol = false;
+    return;
+  }
+
+  if (!waitingSecondSymbol)
+  {
+    const uint8_t identifier = decoded >> 2;
+
+    // Pour la detection d'adresse du canal 1, seuls ID1 et ID2
+    // peuvent constituer le premier symbole interessant.
+    if ((identifier == 1) || (identifier == 2))
+    {
+      firstDecodedSymbol = decoded;
+      waitingSecondSymbol = true;
+    }
+
+    return;
+  }
+
+  // Nous avons deja un premier symbole ID1/ID2.
+  // Tout symbole de donnees 0..63 est valable en deuxieme position.
+  processAddressDatagram(firstDecodedSymbol, decoded);
+
+  waitingSecondSymbol = false;
+}
+
+// -----------------------------------------------------------------------------
+// Tache de reception UART RailCom
+// -----------------------------------------------------------------------------
+
+void railComTask(void *parameter)
+{
+  (void)parameter;
+
+  uart_event_t event;
 
   for (;;)
   {
-    do
+    // Le reveil periodique ne sert qu'au watchdog de perte RailCom.
+    // La reception UART elle-meme reste entierement evenementielle.
+    if (xQueueReceive(
+          railcomUartQueue,
+          &event,
+          pdMS_TO_TICKS(50)
+        ) == pdTRUE)
     {
-      xQueueReceive(xQueue_0, &inByte, pdMS_TO_TICKS(portMAX_DELAY));
-
-      if (inByte == '\0')
-        start = true;
-    } while (!start);
-    start = false;
-
-    for (byte i = 0; i < 2; i++)
-    {
-      if (xQueueReceive(xQueue_0, &inByte, pdMS_TO_TICKS(portMAX_DELAY)) == pdPASS)
+      switch (event.type)
       {
-        if (inByte > 0x0F && inByte < 0xF0)
+        case UART_DATA:
         {
-          if (check_4_8_code())
+          size_t remaining = event.size;
+
+          while (remaining > 0)
           {
-            rxArray[rxArrayCnt] = inByte;
-            rxArrayCnt++;
+            uint8_t temp[32];
+            const size_t requested =
+              (remaining < sizeof(temp)) ? remaining : sizeof(temp);
+
+            const int received = uart_read_bytes(
+              RAILCOM_UART_NUM,
+              temp,
+              requested,
+              0
+            );
+
+            if (received <= 0)
+            {
+              break;
+            }
+
+            for (int i = 0; i < received; i++)
+            {
+              feedRailComByte(temp[i]);
+            }
+
+            remaining -= static_cast<size_t>(received);
           }
+          break;
         }
+
+        case UART_FIFO_OVF:
+        case UART_BUFFER_FULL:
+          uart_flush_input(RAILCOM_UART_NUM);
+          xQueueReset(railcomUartQueue);
+          adr1Valid = false;
+          adr2Valid = false;
+          waitingSecondSymbol = false;
+          candidateAddress = 0;
+          confirmationCount = 0;
+          break;
+
+        case UART_FRAME_ERR:
+        case UART_PARITY_ERR:
+        case UART_BREAK:
+        default:
+          break;
       }
     }
 
-    if (rxArrayCnt == 2)
-    {
-      if (rxArray[0] & CH1_ADR_HIGH)
-        dccAddr[0] = rxArray[1] | (rxArray[0] << 6);
-      if (rxArray[0] & CH1_ADR_LOW)
-        dccAddr[1] = rxArray[1] | (rxArray[0] << 6);
-      address = (dccAddr[1] - 128) << 8;
-      if (address < 0)
-        address = dccAddr[0];
-      else
-        address += dccAddr[0];
-
-      bool testOk = true;
-      uint16_t j = 0;
-      buffer.pop(j);
-      buffer.push(address);
-      do
-      {
-        if (buffer[j] != address)
-        {
-          testOk = false;
-          vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(100));
-        }
-        j++;
-      } while (testOk && j <= buffer.size());
-
-      if (testOk)
-        printAdress();
-      // else
-      //   Serial.println("NOK");
-    }
-
-    rxArrayCnt = 0;
-    for (byte i = 0; i < 2; i++)
-      rxArray[i] = 0;
-
-    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10)); // toutes les x ms
+    checkRailComLoss();
   }
 }
 
-void printAddress(void *p)
-{
-  TickType_t xLastWakeTime;
-  xLastWakeTime = xTaskGetTickCount();
-  uint16_t address{0};
-
-  for (;;)
-  {
-    address = 0;
-    xQueueReceive(xQueue_1, &address, pdMS_TO_TICKS(0));
-    // Serial.println(address);
-    xQueueSend(xQueue_2, &address, portMAX_DELAY);
-    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(100)); // toutes les x ms
-  }
-}
-
-void displayAddAddress(void *p)
-{
-  TickType_t xLastWakeTime;
-  xLastWakeTime = xTaskGetTickCount();
-  uint16_t address{0};
-  const byte pinOutCathode[] = {22, 21, 32, 25, 26, 23, 33};
-  const byte pinOutAnode[] = {19, 18, 12, 13};
-  const byte chiffre[] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x7, 0x7F, 0x6F};
-  uint8_t unit, dizaine, centaine, millier;
-
-  for (auto el : pinOutCathode)
-  {
-    pinMode(el, OUTPUT);
-    digitalWrite(el, HIGH);
-  }
-
-  for (auto el : pinOutAnode)
-  {
-    pinMode(el, OUTPUT);
-    digitalWrite(el, LOW);
-  }
-
-  auto separateur = [&](uint16_t address)
-  {
-    if (address > 999)
-    {
-      millier = address / 1000; // on recupere les milliers
-      address -= millier * 1000;
-    }
-    else
-      millier = 0;
-
-    if (address > 99)
-    {
-      centaine = address / 100; // on recupere les centaines
-      address -= centaine * 100;
-    }
-    else
-      centaine = 0;
-
-    if (address > 9)
-    {
-      dizaine = address / 10; // on recupere les centaines
-      address -= dizaine * 10;
-    }
-    else
-      dizaine = 0;
-
-    unit = address; // on recupere les unites
-  };
-
-  for (;;)
-  {
-    xQueueReceive(xQueue_2, &address, pdMS_TO_TICKS(0));
-    separateur(address);
-
-    for (byte j = 0; j < 4; j++)
-    {
-      digitalWrite(pinOutAnode[j], HIGH); // Unités
-      bool etat;
-      for (byte i = 0; i < 7; i++)
-      {
-        switch (j)
-        {
-        case 0:
-          etat = (chiffre[unit] & (1 << i)) >> i;
-          break;
-        case 1:
-          if (millier > 0 || centaine > 0 || dizaine > 0)
-            etat = (chiffre[dizaine] & (1 << i)) >> i;
-          break;
-        case 2:
-          if (millier > 0 || centaine > 0)
-            etat = (chiffre[centaine] & (1 << i)) >> i;
-          break;
-        case 3:
-          if (millier > 0)
-            etat = (chiffre[millier] & (1 << i)) >> i;
-          break;
-        }
-        digitalWrite(pinOutCathode[i], !etat);
-        etat = 0;
-      }
-      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1)); // toutes les x ms
-      digitalWrite(pinOutAnode[j], LOW);
-    }
-  }
-}
+// -----------------------------------------------------------------------------
+// Arduino
+// -----------------------------------------------------------------------------
 
 void setup()
 {
   Serial.begin(115200);
+  delay(200);
 
-  Serial.printf("\n\nProject :    %s", PROJECT);
-  Serial.printf("\nVersion :      %s", VERSION);
-  Serial.printf("\nAuthor :       %s", AUTHOR);
-  Serial.printf("\nFichier :      %s", __FILE__);
-  Serial.printf("\nCompiled :     %s", __DATE__);
-  Serial.printf(" - %s\n\n", __TIME__);
+  initRailComUart();
 
-  Serial1.begin(250000, SERIAL_8N1, railComRX, railComTX); // Port série pour la réception des données (250k bauds)
-  uint16_t x = 0;
-  for (uint8_t i = 0; i < NB_ADDRESS_TO_COMPARE; i++) // On place des zéros dans le buffer de comparaison
-    buffer.push(x);
-#ifdef CUTOUT
-  pinMode(cutOutPin, INPUT_PULLUP);
-#endif
-  xQueue_0 = xQueueCreate(QUEUE_SIZE_0, sizeof(uint8_t));
-  xQueue_1 = xQueueCreate(QUEUE_SIZE_1, sizeof(uint16_t));
-  xQueue_2 = xQueueCreate(QUEUE_SIZE_2, sizeof(uint16_t));                                  // Création de la file pour les échanges de data entre les 2 tâches
-  xTaskCreatePinnedToCore(receiveData, "ReceiveData", 2 * 1024, NULL, 4, NULL, 1);          // Création de la tâches pour la réception
-  xTaskCreatePinnedToCore(parseData, "ParseData", 2 * 1024, NULL, 5, NULL, 0);              // Création de la tâches pour le traitement
-  xTaskCreatePinnedToCore(printAddress, "PrintAddress", 2 * 1024, NULL, 4, NULL, 0);        // Création de la tâches pour l'affichage (1/2)
-  xTaskCreatePinnedToCore(displayAddAddress, "DisplayAddress", 2 * 1024, NULL, 5, NULL, 0); // Création de la tâches pour l'affichage (2/2)
+  // La tache UART est bloquee sur la file d'evenements quand aucune donnee
+  // RailCom n'arrive : aucun polling periodique n'est necessaire.
+  xTaskCreatePinnedToCore(
+    railComTask,
+    "RailComUART",
+    4096,
+    nullptr,
+    5,
+    nullptr,
+    1
+  );
+
 }
 
 void loop()
 {
+  // Tout est gere par les taches FreeRTOS et le peripherique UART.
+  vTaskDelay(portMAX_DELAY);
 }
