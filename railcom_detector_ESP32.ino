@@ -1,5 +1,5 @@
 /*
-   RailCom Detector ESP32 - v4.5
+   RailCom Detector ESP32 - v4.6
 
    Evolution de la version v3.1 :
    - reception RailCom par le driver UART ESP-IDF
@@ -9,8 +9,9 @@
    - lecture evenementielle, parseur continu independant des frontieres UART_DATA
    - suppression du polling Serial1.available() et des temporisations de reception
    - conservation du decodage 4/8 RailCom canal 1
-   - validation d'adresse par 5 lectures consecutives identiques
-   - perte RailCom apres 1 seconde sans confirmation de l'adresse
+   - validation d'une nouvelle adresse par 5 reconstructions identiques
+   - presence rafraichie des qu'une adresse deja validee est revue
+   - perte RailCom apres 1 seconde sans revoir l'adresse validee
    - sortie : Serial uniquement
 
    © Christophe BOBILLE - Locoduino
@@ -27,7 +28,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
-#define VERSION "v 4.5-serial"
+#define VERSION "v 4.6-serial"
 #define PROJECT "Railcom Detector ESP32 - UART event driven"
 #define AUTHOR  "christophe BOBILLE - Locoduino"
 
@@ -58,8 +59,8 @@ constexpr uint8_t RAILCOM_RX_TIMEOUT_SYMBOLS = 2;
 // Nombre de reconstructions identiques consecutives avant validation.
 constexpr uint8_t ADDRESS_CONFIRMATIONS = 5;
 
-// Une adresse validee est consideree perdue si aucun nouveau groupe de
-// confirmations valides n'est obtenu pendant ce delai.
+// Une adresse validee est consideree perdue si elle n'est plus reconstruite
+// correctement pendant ce delai.
 // 1000 ms evite les extinctions sur un trou ponctuel tout en restant reactif.
 constexpr uint32_t RAILCOM_LOSS_TIMEOUT_MS = 1000;
 
@@ -183,20 +184,50 @@ bool decode4of8(uint8_t raw, uint8_t &decoded)
   return true;
 }
 
-uint16_t buildAddress()
+bool buildAddress(uint16_t &address)
 {
-  // Meme principe que la V3.1, mais ecrit explicitement :
-  // - ADR1 < 128 => adresse courte / consist : adresse dans ADR2
-  // - ADR1 >= 128 => adresse etendue : 6 bits hauts dans ADR1,
-  //   apres retrait du marqueur 0b10xxxxxx, puis 8 bits bas dans ADR2.
-  if (adr1Data < 128)
+  // ADR1 indique le type d'adresse transmis par RailCom :
+  //
+  //   0x00       : adresse primaire courte
+  //   0x60       : adresse de consist
+  //   10xxxxxx   : adresse etendue
+  //
+  // Toute autre valeur d'ADR1 est rejetee. Le codage 4/8 garantit qu'un
+  // symbole est valide, mais pas que son contenu constitue un ADR1 coherent.
+
+  // Adresse primaire courte : ADR2 contient 0AAAAAAA.
+  if (adr1Data == 0x00)
   {
-    return adr2Data;
+    if ((adr2Data & 0x80) != 0)
+    {
+      return false;
+    }
+
+    address = static_cast<uint16_t>(adr2Data & 0x7F);
+    return address != 0;
   }
 
-  return static_cast<uint16_t>(
-    (static_cast<uint16_t>(adr1Data - 128) << 8) | adr2Data
-  );
+  // Adresse de consist : ADR2 contient RAAAAAAA.
+  // Le bit 7 indique le sens relatif dans le consist ; address() retourne
+  // uniquement l'adresse du consist.
+  if (adr1Data == 0x60)
+  {
+    address = static_cast<uint16_t>(adr2Data & 0x7F);
+    return address != 0;
+  }
+
+  // Adresse DCC etendue : ADR1 = 10AAAAAA et ADR2 = AAAAAAAA.
+  if ((adr1Data & 0xC0) == 0x80)
+  {
+    address = static_cast<uint16_t>(
+      (static_cast<uint16_t>(adr1Data & 0x3F) << 8) |
+      adr2Data
+    );
+
+    return address != 0;
+  }
+
+  return false;
 }
 
 void validateAddress(uint16_t address)
@@ -208,7 +239,25 @@ void validateAddress(uint16_t address)
     return;
   }
 
-  // Toute adresse differente casse la serie de confirmations.
+  const uint32_t now = millis();
+
+  // Adresse deja validee :
+  // une seule reconstruction complete et correcte suffit pour confirmer
+  // que la locomotive est toujours presente.
+  if ((lastValidatedAddress != 0) &&
+      (address == lastValidatedAddress))
+  {
+    lastValidatedReceptionMs = now;
+
+    // Si une autre adresse etait en cours de validation, le retour de
+    // l'adresse connue casse cette serie.
+    candidateAddress = 0;
+    confirmationCount = 0;
+    return;
+  }
+
+  // Nouvelle adresse candidate :
+  // elle doit etre reconstruite 5 fois de suite avant d'etre acceptee.
   if (address != candidateAddress)
   {
     candidateAddress = address;
@@ -221,31 +270,20 @@ void validateAddress(uint16_t address)
     confirmationCount++;
   }
 
-  // Il faut 5 reconstructions identiques consecutives pour :
-  // - valider une nouvelle adresse ;
-  // - ou confirmer qu'une adresse deja affichee est toujours presente.
   if (confirmationCount < ADDRESS_CONFIRMATIONS)
   {
     return;
   }
 
-  const uint32_t now = millis();
-
-  if (address != lastValidatedAddress)
-  {
-    lastValidatedAddress = address;
-    currentAddress = address;
-
-    Serial.printf("Adresse loco validee : %u\n", address);
-  }
-
-  // Le watchdog de presence n'est rafraichi qu'apres un nouveau groupe
-  // complet de 5 confirmations consecutives.
+  // Nouvelle adresse validee.
+  lastValidatedAddress = address;
+  currentAddress = address;
   lastValidatedReceptionMs = now;
 
-  // On repart de zero pour exiger un nouveau groupe de 5 confirmations
-  // avant le prochain rafraichissement du watchdog.
+  candidateAddress = 0;
   confirmationCount = 0;
+
+  Serial.printf("Adresse loco validee : %u", address);
 }
 
 void checkRailComLoss()
@@ -328,13 +366,25 @@ void processAddressDatagram(uint8_t symbol0, uint8_t symbol1)
 
   if (adr1Valid && adr2Valid)
   {
-    const uint16_t address = buildAddress();
+    uint16_t address = 0;
+    const bool addressValid = buildAddress(address);
 
     // Les deux morceaux sont consommes ensemble.
     adr1Valid = false;
     adr2Valid = false;
 
-    validateAddress(address);
+    if (addressValid)
+    {
+      validateAddress(address);
+    }
+    else
+    {
+      // Une combinaison ADR1/ADR2 semantiquement invalide casse la serie
+      // de validation d'une nouvelle adresse, sans affecter une adresse
+      // deja validee ni son watchdog.
+      candidateAddress = 0;
+      confirmationCount = 0;
+    }
   }
 }
 
