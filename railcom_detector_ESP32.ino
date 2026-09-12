@@ -411,7 +411,6 @@ void feedRailComByte(uint8_t raw)
       firstDecodedSymbol = decoded;
       waitingSecondSymbol = true;
     }
-
     return;
   }
 
@@ -494,14 +493,9 @@ void railComTask(void *parameter)
           break;
       }
     }
-
     checkRailComLoss();
   }
 }
-
-// -----------------------------------------------------------------------------
-// Arduino
-// -----------------------------------------------------------------------------
 
 void setup()
 {
@@ -521,7 +515,6 @@ void setup()
     nullptr,
     1
   );
-
 }
 
 void loop()
